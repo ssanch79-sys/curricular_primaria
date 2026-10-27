@@ -1,0 +1,954 @@
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { Grade, Activity, CurriculumItem, AiResponse, Session } from './types';
+import { 
+  SUBJECTS, 
+  TRANSVERSAL_COMPETENCIES, 
+  GRADES, 
+  SCHOOL_YEARS, 
+  SUBJECT_ICONS,
+  COLOR_MAP
+} from './constants'; 
+import { 
+  getCurriculumSuggestions, 
+  generateDetailedActivities, 
+  suggestEvaluationTools, 
+  generateEvaluationToolContent,
+  getTitleOptions,
+  getDescriptionForTitle
+} from './services/geminiService';
+import ActivityCard from './components/ActivityCard';
+import CurriculumResults from './components/CurriculumResults';
+import ActivityDetailsModal from './components/ActivityDetailsModal';
+import CalendarView from './components/CalendarView';
+import AnalyticsPanel from './components/AnalyticsPanel';
+import { validateActivity } from './services/validationService';
+import { 
+  PlusCircle, ArrowLeft, Loader2, Save, School, Wand2, X, Sparkles, ChevronRight, Check, Search, Lightbulb, Flag, Target, Compass, GraduationCap, 
+  Upload, Download, AlertCircle, ChevronUp, ChevronDown, Trash2, Plus, ShieldCheck, AlertTriangle
+} from 'lucide-react';
+
+type ViewType = 'dashboard' | 'calendar' | 'analytics' | 'create';
+type CreateTab = 'basics' | 'curriculum' | 'sequence' | 'evaluation' | 'validation';
+
+const APP_VERSION = "4.5";
+const STORAGE_KEY = 'einacurricular_data_v4';
+
+const generateId = () => Math.random().toString(36).substr(2, 9);
+const DEFAULT_AI_MODEL = 'gemini-3-flash-preview';
+
+const TAB_LABELS: Record<string, string> = {
+  basics: 'Pas 1: Informació',
+  curriculum: 'Pas 2: Currículum',
+  sequence: 'Pas 3: Sessions',
+  evaluation: 'Pas 4: Avaluació',
+  validation: 'Pas 5: Validació'
+};
+
+export default function App() {
+  const [view, setView] = useState<ViewType>('dashboard');
+  const [activeTab, setActiveTab] = useState<CreateTab>('basics');
+  const [activities, setActivities] = useState<Activity[]>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      return saved ? JSON.parse(saved) : [];
+    } catch (e) { return []; }
+  });
+  
+  const [notification, setNotification] = useState<{message: string, type: 'error' | 'success'} | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Form State
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [title, setTitle] = useState('');
+  const [description, setDescription] = useState('');
+  const [grade, setGrade] = useState<Grade>(Grade.First);
+  const [selectedSubjectIds, setSelectedSubjectIds] = useState<string[]>([]);
+  const [detailedActivities, setDetailedActivities] = useState<Session[]>([]);
+  const [sessionDates, setSessionDates] = useState<string[]>([]); 
+  const [evaluationTools, setEvaluationTools] = useState<string[]>([]); 
+  const [suggestedEvaluationTools, setSuggestedEvaluationTools] = useState<string[]>([]); 
+  const [evaluationToolsContent, setEvaluationToolsContent] = useState<Record<string, string>>({});
+  const [selectedCurriculum, setSelectedCurriculum] = useState<CurriculumItem[]>([]);
+  const [suggestions, setSuggestions] = useState<AiResponse | null>(null);
+  const [numSessions, setNumSessions] = useState<number>(6);
+
+  const [searchQuery, setSearchQuery] = useState('');
+  const [viewingActivity, setViewingActivity] = useState<Activity | null>(null);
+
+  const [showInspirationModal, setShowInspirationModal] = useState(false);
+  const [inspirationOptions, setInspirationOptions] = useState<{title: string, style: string}[]>([]);
+  const [isGeneratingDescription, setIsGeneratingDescription] = useState(false);
+
+  const [aiLoading, setAiLoading] = useState(false);
+  const [inspirationLoading, setInspirationLoading] = useState(false);
+  const [sequenceLoading, setSequenceLoading] = useState(false);
+  const [evalLoading, setEvalLoading] = useState(false);
+  const [generatingToolContent, setGeneratingToolContent] = useState(false); 
+
+  const validationReport = useMemo(() => {
+    return validateActivity({
+      title,
+      description,
+      grade,
+      subjectIds: selectedSubjectIds,
+      competencies: selectedCurriculum.filter(i => i.type === 'competencia'),
+      criteria: selectedCurriculum.filter(i => i.type === 'criteri'),
+      sabers: selectedCurriculum.filter(i => i.type === 'saber'),
+      detailedActivities
+    });
+  }, [title, description, grade, selectedSubjectIds, selectedCurriculum, detailedActivities]);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(activities));
+  }, [activities]);
+
+  const showNotification = (message: string, type: 'error' | 'success' = 'error') => {
+    setNotification({ message, type });
+    setTimeout(() => setNotification(null), 6000);
+  };
+
+  const handleGeminiError = (e: any) => {
+    console.error("Gemini Error:", e);
+    const msg = e?.message || "";
+    if (msg.includes("429")) {
+      showNotification("Quota saturada de l'IA. Espera uns instants.", "error");
+    } else {
+      showNotification(msg || "Error de l'IA. Torna-ho a provar.", "error");
+    }
+  };
+
+  const startEditing = (act: Activity) => {
+    setEditingId(act.id); 
+    setTitle(act.title); 
+    setDescription(act.description); 
+    setGrade(act.grade);
+    setSelectedSubjectIds(act.subjectIds || []); 
+    setDetailedActivities(act.detailedActivities || []);
+    setSessionDates(act.sessionDates || []); 
+    setSelectedCurriculum([...(act.competencies || []), ...(act.criteria || []), ...(act.sabers || [])]);
+    setEvaluationTools(act.evaluationTools || []); 
+    setEvaluationToolsContent(act.evaluationToolsContent || {});
+    setView('create'); 
+    setViewingActivity(null); 
+  };
+
+  const handleSave = () => {
+    if (!title.trim()) return showNotification("Cal posar un títol a la SA", "error");
+    
+    if (!validationReport.isValid) {
+      const confirmSave = window.confirm("La Situació d'Aprenentatge no compleix tots els requisits del Decret 175/2022. Vols desar-la igualment?");
+      if (!confirmSave) return;
+    }
+
+    const allSubs = [...SUBJECTS, ...TRANSVERSAL_COMPETENCIES];
+    const subNames = selectedSubjectIds.map(id => allSubs.find(s => s.id === id)?.name || '').join(' + ');
+
+    const primarySubjectId = selectedSubjectIds[0];
+    const primarySubject = allSubs.find(s => s.id === primarySubjectId);
+    const saColor = primarySubject ? `bg-${primarySubject.color}-600` : 'bg-blue-600';
+
+    const updatedActivity: Activity = {
+      id: editingId || generateId(),
+      title: title.trim(), 
+      description: description.trim(), 
+      grade, 
+      schoolYear: SCHOOL_YEARS[0], 
+      subject: subNames || 'Sense àrea definida',
+      subjectIds: [...selectedSubjectIds],
+      detailedActivities: [...detailedActivities],
+      sessionDates: [...sessionDates], 
+      evaluationTools: [...evaluationTools], 
+      evaluationToolsContent: { ...evaluationToolsContent },
+      competencies: selectedCurriculum.filter(i => i.type === 'competencia'),
+      criteria: selectedCurriculum.filter(i => i.type === 'criteri'),
+      sabers: selectedCurriculum.filter(i => i.type === 'saber'),
+      createdAt: editingId ? (activities.find(a => a.id === editingId)?.createdAt || Date.now()) : Date.now(),
+      color: saColor
+    };
+
+    setActivities(prev => [updatedActivity, ...prev.filter(a => a.id !== updatedActivity.id)]);
+    setView('dashboard');
+    showNotification("Situació d'Aprenentatge guardada!", "success");
+    resetForm();
+  };
+
+  const resetForm = () => {
+    setEditingId(null); setTitle(''); setDescription(''); setGrade(Grade.First); 
+    setDetailedActivities([]); setSessionDates([]); setSelectedCurriculum([]); setSuggestions(null); 
+    setEvaluationTools([]); setSuggestedEvaluationTools([]); setEvaluationToolsContent({}); 
+    setActiveTab('basics'); setNumSessions(6);
+  };
+
+  // --- Sistema d'Exportació/Importació ---
+  
+  const triggerDownload = (data: string, fileName: string) => {
+    const blob = new Blob([data], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }, 100);
+  };
+
+  const handleExportAll = () => {
+    if (activities.length === 0) return showNotification("No hi ha dades per exportar.", "error");
+    const exportData = {
+      app: "Eina Curricular",
+      version: APP_VERSION,
+      exportDate: new Date().toISOString(),
+      type: "backup_total",
+      data: activities
+    };
+    triggerDownload(JSON.stringify(exportData, null, 2), `Backup_SAs_${new Date().toISOString().slice(0, 10)}.json`);
+    showNotification("Exportació de totes les SAs completada.", "success");
+  };
+
+  const handleExportSingle = (activity: Activity) => {
+    const exportData = {
+      app: "Eina Curricular",
+      version: APP_VERSION,
+      exportDate: new Date().toISOString(),
+      type: "sa_individual",
+      data: [activity]
+    };
+    const fileName = `SA_${activity.title.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.json`;
+    triggerDownload(JSON.stringify(exportData, null, 2), fileName);
+    showNotification(`"${activity.title}" exportada correctament.`, "success");
+  };
+
+  const handleImport = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const content = event.target?.result as string;
+        const parsed = JSON.parse(content);
+        
+        // Validació de format
+        let itemsToImport: Activity[] = [];
+        if (parsed.app === "Eina Curricular" && Array.isArray(parsed.data)) {
+          itemsToImport = parsed.data;
+        } else if (Array.isArray(parsed)) {
+          itemsToImport = parsed;
+        } else if (parsed.title && parsed.description) {
+          itemsToImport = [parsed];
+        }
+
+        if (itemsToImport.length === 0) throw new Error("Format no reconegut");
+
+        // Afegir directament a la llista actual generant nous IDs per evitar col·lisions
+        const cleaned = itemsToImport.map(item => ({
+          ...item, 
+          id: generateId(),
+          createdAt: Date.now() // Actualitzem la data perquè surtin al principi
+        }));
+        
+        setActivities(prev => [...cleaned, ...prev]);
+        showNotification(`S'han afegit ${itemsToImport.length} SAs a la teva col·lecció.`, "success");
+        
+      } catch (err) {
+        showNotification("Error en importar: El fitxer no és vàlid.", "error");
+      }
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    };
+    reader.readAsText(file);
+  };
+
+  // --- Sessions Control ---
+
+  const handleAddSession = () => {
+    const newSession: Session = {
+      title: 'Nova Sessió',
+      objective: '',
+      methodology: '',
+      steps: '',
+      evaluation: '',
+      dua: ''
+    };
+    setDetailedActivities(prev => [...prev, newSession]);
+    setSessionDates(prev => [...prev, '']);
+  };
+
+  const handleRemoveSession = (idx: number) => {
+    if (window.confirm("Vols eliminar aquesta sessió?")) {
+      setDetailedActivities(prev => prev.filter((_, i) => i !== idx));
+      setSessionDates(prev => prev.filter((_, i) => i !== idx));
+    }
+  };
+
+  const handleMoveSession = (idx: number, direction: 'up' | 'down') => {
+    if (direction === 'up' && idx === 0) return;
+    if (direction === 'down' && idx === detailedActivities.length - 1) return;
+
+    const newIdx = direction === 'up' ? idx - 1 : idx + 1;
+    
+    const newSessions = [...detailedActivities];
+    [newSessions[idx], newSessions[newIdx]] = [newSessions[newIdx], newSessions[idx]];
+    
+    const newDates = [...sessionDates];
+    [newDates[idx], newDates[newIdx]] = [newDates[newIdx], newDates[idx]];
+
+    setDetailedActivities(newSessions);
+    setSessionDates(newDates);
+  };
+
+  const updateSessionField = (idx: number, field: keyof Session, value: string) => {
+    setDetailedActivities(prev => {
+      const copy = [...prev];
+      copy[idx] = { ...copy[idx], [field]: value };
+      return copy;
+    });
+  };
+
+  // --- IA Control ---
+
+  const handleAiCurriculum = async () => {
+    if (aiLoading) return;
+    if (!description || selectedSubjectIds.length === 0) return showNotification("Cal descripció i àrees seleccionades.", "error");
+    setAiLoading(true);
+    try {
+      const allPossible = [...SUBJECTS, ...TRANSVERSAL_COMPETENCIES];
+      const selectedSubjectsInfo = selectedSubjectIds.map(id => {
+        const s = allPossible.find(x => x.id === id);
+        return { id: id, name: s?.name || '' };
+      });
+      const res = await getCurriculumSuggestions(selectedSubjectsInfo, grade, description, DEFAULT_AI_MODEL);
+      setSuggestions(res);
+      showNotification("Currículum analitzat correctament.", "success");
+    } catch (e: any) {
+      handleGeminiError(e);
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
+  const handleGenerateSequence = async () => {
+    if (sequenceLoading) return;
+    if (!title || !description) return showNotification("Omple títol i descripció.", "error");
+    setSequenceLoading(true);
+    try {
+      const allPossible = [...SUBJECTS, ...TRANSVERSAL_COMPETENCIES];
+      const subNames = selectedSubjectIds.map(id => allPossible.find(s => s.id === id)?.name || '');
+      const res = await generateDetailedActivities(title, description, grade, subNames, numSessions, DEFAULT_AI_MODEL);
+      setDetailedActivities(res);
+      setSessionDates(Array(res.length).fill('')); 
+      showNotification("Sessions generades amb èxit.", "success");
+    } catch (e) {
+      handleGeminiError(e);
+    } finally {
+      setSequenceLoading(false);
+    }
+  };
+
+  const handleSuggestEvalTools = async () => {
+    if (evalLoading) return;
+    const selectedCriteria = selectedCurriculum.filter(i => i.type === 'criteri');
+    if (selectedCriteria.length === 0) return showNotification("Tria criteris d'avaluació primer.", "error");
+    setEvalLoading(true);
+    try {
+      const tools = await suggestEvaluationTools(title, grade, selectedCriteria, DEFAULT_AI_MODEL);
+      setSuggestedEvaluationTools(tools);
+      setEvaluationTools(tools); 
+      showNotification("Instruments suggerits.", "success");
+    } catch (e) {
+      handleGeminiError(e);
+    } finally {
+      setEvalLoading(false);
+    }
+  };
+
+  const handleGenerateSelectedToolContent = async () => {
+    if (generatingToolContent) return;
+    if (evaluationTools.length === 0) return showNotification("Selecciona instruments primer.", "error");
+    setGeneratingToolContent(true);
+    try {
+      const contents: Record<string, string> = { ...evaluationToolsContent };
+      const criteria = selectedCurriculum.filter(i => i.type === 'criteri');
+      for (const t of evaluationTools) {
+        if (!contents[t]) {
+          contents[t] = await generateEvaluationToolContent(t, title, grade, criteria, DEFAULT_AI_MODEL);
+          await new Promise(r => setTimeout(r, 2000));
+        }
+      }
+      setEvaluationToolsContent(contents);
+      showNotification("Contingut d'avaluació generat correctament.", "success");
+    } catch (e) {
+      handleGeminiError(e);
+    } finally {
+      setGeneratingToolContent(false);
+    }
+  };
+
+  const handleInspiration = async () => {
+    if (inspirationLoading) return;
+    if (selectedSubjectIds.length === 0) return showNotification("Tria una àrea per poder inspirar-te.", "error");
+    setInspirationLoading(true);
+    try {
+      const allPossible = [...SUBJECTS, ...TRANSVERSAL_COMPETENCIES];
+      const subNames = selectedSubjectIds.map(id => allPossible.find(s => s.id === id)?.name || '');
+      const options = await getTitleOptions(subNames, grade, title, DEFAULT_AI_MODEL);
+      
+      if (options && options.length > 0) {
+        setInspirationOptions(options);
+        setShowInspirationModal(true);
+      } else {
+        showNotification("No s'han rebut idees de l'IA.", "error");
+      }
+    } catch (e) {
+      handleGeminiError(e);
+    } finally {
+      setInspirationLoading(false);
+    }
+  };
+
+  const selectInspiration = async (opt: string) => {
+    setTitle(opt);
+    setShowInspirationModal(false);
+    setIsGeneratingDescription(true);
+    try {
+      const allPossible = [...SUBJECTS, ...TRANSVERSAL_COMPETENCIES];
+      const subNames = selectedSubjectIds.map(id => allPossible.find(s => s.id === id)?.name || '');
+      const desc = await getDescriptionForTitle(opt, subNames, grade, DEFAULT_AI_MODEL);
+      setDescription(desc);
+      showNotification("Descripció generada amb èxit.", "success");
+    } catch (e) {
+      handleGeminiError(e);
+    } finally {
+      setIsGeneratingDescription(false);
+    }
+  };
+
+  const filteredActivities = useMemo(() => {
+    return activities
+      .filter(a => a.title.toLowerCase().includes(searchQuery.toLowerCase()))
+      .sort((a, b) => b.createdAt - a.createdAt);
+  }, [activities, searchQuery]);
+
+  return (
+    <div className="min-h-screen bg-[#fcfdfe] text-slate-800 flex flex-col font-sans selection:bg-blue-100 selection:text-blue-900">
+      <nav className="bg-white/80 backdrop-blur-md border-b border-blue-100 sticky top-0 z-40 h-16 flex items-center px-6 justify-between shadow-sm">
+        <div className="flex items-center gap-3 cursor-pointer group" onClick={() => setView('dashboard')}>
+          <div className="bg-gradient-to-tr from-blue-600 to-blue-400 text-white p-2 rounded-xl shadow-lg group-hover:rotate-6 transition-transform">
+            <GraduationCap size={20} />
+          </div>
+          <div className="flex flex-col">
+            <span className="font-extrabold text-xl tracking-tight leading-none text-slate-900">
+              EINA<span className="text-blue-600">CURRICULAR</span>
+            </span>
+          </div>
+        </div>
+        
+        <div className="flex items-center gap-6">
+          <div className="hidden md:flex items-center gap-8">
+            {['dashboard', 'calendar', 'analytics'].map((v) => (
+              <button 
+                key={v}
+                onClick={() => setView(v as ViewType)} 
+                className={`text-[11px] font-black uppercase tracking-widest transition-all relative py-2 ${view === v ? 'text-blue-600' : 'text-slate-400 hover:text-slate-900'}`}
+              >
+                {v === 'dashboard' ? 'Inici' : v === 'calendar' ? 'Calendari' : 'Estadístiques'}
+                {view === v && <span className="absolute -bottom-1 left-0 w-full h-1 bg-blue-600 rounded-full"></span>}
+              </button>
+            ))}
+          </div>
+        </div>
+      </nav>
+
+      <main className="flex-grow p-6 max-w-[1400px] mx-auto w-full mb-16">
+        {view === 'dashboard' && (
+          <div className="animate-fade-in">
+            <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-10 gap-6 bg-white p-8 rounded-[2.5rem] border border-blue-50 shadow-sm">
+              <div>
+                <h1 className="text-4xl font-black text-slate-900 tracking-tight leading-tight">Programació d'Aula</h1>
+                <p className="text-slate-500 font-bold mt-1">S'han detectat <span className="text-blue-600">{activities.length}</span> projectes desats.</p>
+              </div>
+              <div className="flex flex-col sm:flex-row gap-3 w-full md:w-auto">
+                <div className="relative flex-grow">
+                  <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-300" size={18} />
+                  <input type="text" placeholder="Cerca SA..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)} className="bg-slate-50 border-2 border-slate-100 pl-11 pr-5 py-3 rounded-2xl text-sm font-bold outline-none focus:border-blue-400 focus:bg-white w-full md:w-64 transition-all" />
+                </div>
+                <button onClick={() => { resetForm(); setView('create'); }} className="bg-blue-600 text-white px-8 py-3 rounded-2xl font-black uppercase text-[11px] tracking-widest shadow-xl shadow-blue-200 flex items-center justify-center gap-2 hover:bg-blue-700 hover:-translate-y-1 transition-all active:scale-95"><PlusCircle size={18} /> Nova SA</button>
+              </div>
+            </div>
+            
+            {filteredActivities.length === 0 ? (
+              <div className="bg-white rounded-[3rem] p-24 text-center border border-blue-100 shadow-sm">
+                <div className="bg-blue-50 w-24 h-24 rounded-full flex items-center justify-center mx-auto mb-8 text-blue-200 animate-pulse">
+                  <Sparkles size={48} />
+                </div>
+                <h3 className="text-2xl font-black text-slate-400">Encara no hi ha cap SA</h3>
+                <p className="text-slate-400 mt-2 font-medium max-w-sm mx-auto">Comença dissenyant un nou projecte educatiu amb l'ajuda de la intel·ligència artificial.</p>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+                {filteredActivities.map(act => (
+                  <ActivityCard 
+                    key={act.id} 
+                    activity={act} 
+                    activitySubjectIds={act.subjectIds || []} 
+                    onDelete={id => setActivities(p => p.filter(a => a.id !== id))} 
+                    onView={setViewingActivity} 
+                    onEdit={() => startEditing(act)} 
+                    onCopy={a => {
+                      const copy = {...a, id: generateId(), title: a.title + ' (Còpia)', createdAt: Date.now()};
+                      setActivities(p => [copy, ...p]);
+                      showNotification("Còpia creada correctament.", "success");
+                    }} 
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {view === 'calendar' && (
+          <CalendarView 
+            activities={activities} 
+            onEditActivity={id => { 
+              const a = activities.find(x => x.id === id); 
+              if(a) setViewingActivity(a); 
+            }} 
+          />
+        )}
+        
+        {view === 'analytics' && <AnalyticsPanel activities={activities} />}
+
+        {view === 'create' && (
+          <div className="max-w-6xl mx-auto bg-white rounded-[3rem] shadow-2xl overflow-hidden border border-blue-50 animate-scale-in flex flex-col min-h-[85vh]">
+            <div className="flex border-b border-blue-50 bg-slate-50/50 p-3 gap-2 overflow-x-auto">
+              {Object.keys(TAB_LABELS).map(t => (
+                <button key={t} onClick={() => setActiveTab(t as CreateTab)} className={`flex-1 min-w-[140px] py-4 rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all ${activeTab === t ? 'bg-white text-blue-600 shadow-md' : 'text-slate-400 hover:bg-white/50'}`}>{TAB_LABELS[t]}</button>
+              ))}
+            </div>
+            
+            <div className="p-10 md:p-14 flex-grow overflow-y-auto custom-scrollbar">
+              {activeTab === 'basics' && (
+                <div className="space-y-16 animate-fade-in">
+                  <div className="grid grid-cols-1 md:grid-cols-12 gap-12">
+                    <div className="md:col-span-4 space-y-4">
+                      <label className="block text-[11px] font-black uppercase tracking-widest text-slate-400 ml-2">Curs escolar</label>
+                      <select className="w-full bg-slate-50 p-5 rounded-2xl font-black text-lg outline-none border border-slate-100 focus:border-blue-400 hover:bg-white transition-all shadow-sm text-slate-700 appearance-none cursor-pointer" value={grade} onChange={e => setGrade(e.target.value as Grade)}>
+                        {GRADES.map(g => <option key={g} value={g}>{g} de Primària</option>)}
+                      </select>
+                    </div>
+
+                    <div className="md:col-span-8 space-y-10">
+                      <div>
+                        <label className="block text-[11px] font-black uppercase tracking-widest text-slate-400 ml-2 mb-6">Àrees i Competències</label>
+                        <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                          {[...SUBJECTS, ...TRANSVERSAL_COMPETENCIES].map(s => {
+                            const colors = COLOR_MAP[s.color] || COLOR_MAP.blue;
+                            const isSelected = selectedSubjectIds.includes(s.id);
+                            
+                            return (
+                              <button 
+                                key={s.id} 
+                                onClick={() => setSelectedSubjectIds(p => p.includes(s.id) ? p.filter(x => x !== s.id) : [...p, s.id])} 
+                                className={`flex items-center gap-3 p-4 rounded-xl border-2 transition-all ${isSelected ? `${colors.bg} text-white ${colors.border} shadow-md` : `bg-white text-slate-500 border-slate-50 ${colors.hoverBorder}`}`}
+                              >
+                                <div className={`${isSelected ? 'text-white' : colors.text}`}>
+                                  {SUBJECT_ICONS[s.id] || SUBJECT_ICONS.default}
+                                </div>
+                                <span className="text-[10px] font-bold text-left leading-tight uppercase tracking-tight">
+                                  {s.name.split(' (')[0].replace('Coneixement del ', '')}
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="space-y-6">
+                    <div className="flex items-center gap-3 ml-2">
+                       <Flag size={20} className="text-blue-600" />
+                       <label className="block text-[11px] font-black uppercase tracking-widest text-slate-400">Títol de la SA</label>
+                    </div>
+                    <div className="flex gap-4 items-center">
+                      <input className="flex-1 text-2xl md:text-4xl font-black outline-none border-b-4 border-slate-50 py-4 focus:border-blue-600 bg-transparent transition-all placeholder:text-slate-100 text-slate-900" placeholder="Escriu el títol aquí..." value={title} onChange={e => setTitle(e.target.value)} />
+                      <button onClick={handleInspiration} disabled={inspirationLoading} className="bg-slate-900 text-white p-5 rounded-2xl hover:bg-black transition-all shadow-xl active:scale-95 disabled:opacity-50 group relative">
+                        {inspirationLoading ? <Loader2 size={24} className="animate-spin" /> : <Wand2 size={24} />}
+                        <span className="absolute -top-12 left-1/2 -translate-x-1/2 bg-slate-800 text-white text-[9px] font-black uppercase tracking-widest px-3 py-1.5 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap">Inspira'm!</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-6">
+                    <div className="flex items-center gap-3 ml-2">
+                       <Target size={20} className="text-blue-600" />
+                       <label className="block text-[11px] font-black uppercase tracking-widest text-slate-400">Descripció i Contextualització</label>
+                    </div>
+                    <div className="relative">
+                      {isGeneratingDescription && (
+                        <div className="absolute inset-0 bg-white/95 backdrop-blur-sm z-10 flex flex-col items-center justify-center rounded-[2rem] border-2 border-dashed border-blue-200">
+                          <Loader2 className="animate-spin text-blue-600 mb-4" size={40} />
+                          <span className="text-[11px] font-black uppercase tracking-[0.2em] text-blue-600 animate-pulse">L'IA està redactant la proposta...</span>
+                        </div>
+                      )}
+                      <textarea className="w-full bg-slate-50 p-10 rounded-[2.5rem] font-bold min-h-[300px] outline-none border border-slate-100 focus:border-blue-200 transition-all leading-relaxed text-slate-700 text-lg shadow-inner placeholder:text-slate-200" placeholder="Descriu el context, el repte inicial i el producte final que es vol aconseguir..." value={description} onChange={e => setDescription(e.target.value)} />
+                    </div>
+                  </div>
+
+                  <div className="flex justify-between items-center pt-10 border-t border-slate-50">
+                    <button onClick={() => setView('dashboard')} className="flex items-center gap-2 text-slate-400 hover:text-slate-900 font-black uppercase tracking-widest text-[10px] transition-colors"><ArrowLeft size={16} /> Tornar enrere</button>
+                    <button onClick={() => setActiveTab('curriculum')} className="bg-slate-900 text-white px-10 py-5 rounded-2xl font-black uppercase text-[11px] tracking-widest flex items-center gap-3 hover:bg-black shadow-lg transition-all active:scale-95">Següent: Currículum <ChevronRight size={16} /></button>
+                  </div>
+                </div>
+              )}
+
+              {activeTab === 'curriculum' && (
+                <div className="animate-fade-in space-y-12">
+                  <div className="bg-gradient-to-br from-blue-600 to-blue-800 p-10 rounded-[2.5rem] flex flex-col md:flex-row items-center justify-between border border-blue-400 shadow-xl gap-8">
+                    <div className="flex gap-6 items-center">
+                      <div className="bg-white/20 p-4 rounded-2xl text-white"><Sparkles size={32} /></div>
+                      <div>
+                        <h4 className="font-black text-white text-2xl tracking-tight">Vincle Curricular Intel·ligent</h4>
+                        <p className="text-blue-100 text-sm font-bold">L'IA cercarà els elements del Decret 175/2022 més adients per a la teva SA.</p>
+                      </div>
+                    </div>
+                    <button onClick={handleAiCurriculum} disabled={aiLoading} className="bg-white text-blue-900 px-8 py-4 rounded-xl font-black uppercase text-[11px] tracking-widest flex items-center gap-3 hover:bg-blue-50 shadow-lg disabled:opacity-50 transition-all">
+                      {aiLoading ? <Loader2 size={18} className="animate-spin" /> : <Compass size={18} />} Analitzar Currículum
+                    </button>
+                  </div>
+
+                  {suggestions ? (
+                    <CurriculumResults 
+                      data={suggestions} 
+                      selectedItems={selectedCurriculum} 
+                      onToggleItem={(item) => setSelectedCurriculum(prev => prev.some(i => i.code === item.code) ? prev.filter(i => i.code !== item.code) : [...prev, item])} 
+                    />
+                  ) : (
+                    <div className="py-40 text-center border-2 border-dashed border-blue-50 rounded-[3rem] bg-white">
+                       <p className="text-slate-300 font-black uppercase tracking-[0.2em] text-[11px]">Fes clic a "Analitzar Currículum" per obtenir suggeriments de la IA</p>
+                    </div>
+                  )}
+
+                  <div className="flex justify-between items-center pt-10 border-t border-slate-50">
+                    <button onClick={() => setActiveTab('basics')} className="text-slate-400 font-black uppercase tracking-widest text-[10px] hover:text-slate-900 transition-colors">Enrere</button>
+                    <button onClick={() => setActiveTab('sequence')} className="bg-slate-900 text-white px-10 py-5 rounded-2xl font-black uppercase text-[11px] tracking-widest flex items-center gap-3 hover:bg-black shadow-lg transition-all active:scale-95">Següent: Sessions <ChevronRight size={16} /></button>
+                  </div>
+                </div>
+              )}
+
+              {activeTab === 'sequence' && (
+                <div className="animate-fade-in space-y-12">
+                  <div className="flex flex-col md:flex-row justify-between items-center gap-6 bg-slate-50/50 p-8 rounded-[2rem] border border-slate-100">
+                    <div className="flex items-center gap-4">
+                      <div className="flex items-center gap-3 bg-white p-4 rounded-xl shadow-sm border border-slate-50">
+                        <label className="text-[10px] font-black uppercase tracking-widest text-slate-400 ml-2">Nº Sessions:</label>
+                        <input type="number" value={numSessions} onChange={e => setNumSessions(Number(e.target.value))} className="w-16 bg-slate-50 p-2 rounded-lg font-black text-center outline-none border border-slate-100 focus:border-blue-400 text-lg" />
+                      </div>
+                    </div>
+                    <div className="flex gap-3">
+                      <button onClick={handleAddSession} className="bg-white text-slate-700 border border-slate-200 px-6 py-5 rounded-2xl font-black uppercase text-[11px] tracking-widest flex items-center gap-3 shadow-md hover:bg-slate-50 transition-all active:scale-95">
+                        <Plus size={18} /> Afegir Sessió
+                      </button>
+                      <button onClick={handleGenerateSequence} disabled={sequenceLoading} className="bg-blue-600 text-white px-10 py-5 rounded-2xl font-black uppercase text-[11px] tracking-widest flex items-center gap-3 shadow-xl shadow-blue-100 hover:bg-blue-700 disabled:opacity-50 transition-all">
+                        {sequenceLoading ? <Loader2 size={18} className="animate-spin" /> : <Sparkles size={18} />} Dissenyar amb IA
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-10">
+                    {detailedActivities.length > 0 ? detailedActivities.map((session, idx) => (
+                      <div key={idx} className="bg-white border border-slate-100 rounded-[2.5rem] overflow-hidden hover:border-blue-100 transition-all shadow-sm">
+                        <div className="bg-slate-900 px-10 py-6 flex flex-col md:flex-row justify-between items-start md:items-center text-white gap-4">
+                          <div className="flex items-center gap-4 w-full">
+                            <span className="bg-white/10 px-4 py-2 rounded-lg font-black text-[10px] uppercase tracking-widest">Sessió {idx + 1}</span>
+                            <input className="bg-transparent font-black text-white text-xl outline-none border-b border-transparent focus:border-blue-400 placeholder:opacity-40 flex-1" placeholder="Títol de la sessió..." value={session.title} onChange={e => updateSessionField(idx, 'title', e.target.value)} />
+                          </div>
+                          <div className="flex gap-2">
+                             <button onClick={() => handleMoveSession(idx, 'up')} disabled={idx === 0} className="p-2 hover:bg-white/10 rounded-lg disabled:opacity-20 transition-all" title="Pujar sessió"><ChevronUp size={18} /></button>
+                             <button onClick={() => handleMoveSession(idx, 'down')} disabled={idx === detailedActivities.length - 1} className="p-2 hover:bg-white/10 rounded-lg disabled:opacity-20 transition-all" title="Baixar sessió"><ChevronDown size={18} /></button>
+                             <button onClick={() => handleRemoveSession(idx)} className="p-2 hover:bg-red-500/20 text-red-400 rounded-lg transition-all" title="Eliminar sessió"><Trash2 size={18} /></button>
+                          </div>
+                        </div>
+                        <div className="p-10 grid grid-cols-1 md:grid-cols-2 gap-10">
+                            <div className="space-y-4">
+                              <span className="block text-[10px] font-black uppercase text-blue-600 tracking-widest ml-2">Objectiu d'Aprenentatge</span>
+                              <textarea className="w-full bg-slate-50 p-6 rounded-2xl text-base font-bold text-slate-800 outline-none focus:bg-white transition-all border border-slate-100 focus:border-blue-100 shadow-inner" rows={3} value={session.objective} onChange={e => updateSessionField(idx, 'objective', e.target.value)} />
+                            </div>
+                            <div className="space-y-4">
+                              <span className="block text-[10px] font-black uppercase text-slate-400 tracking-widest ml-2">Data prevista</span>
+                              <input 
+                                type="date" 
+                                className="w-full bg-slate-50 p-6 rounded-2xl text-base font-black text-slate-800 outline-none focus:bg-white transition-all border border-slate-100 focus:border-blue-100 shadow-inner" 
+                                value={sessionDates[idx] || ''} 
+                                onChange={e => {
+                                  const newDates = [...sessionDates];
+                                  newDates[idx] = e.target.value;
+                                  setSessionDates(newDates);
+                                }} 
+                              />
+                            </div>
+                            <div className="space-y-4">
+                              <span className="block text-[10px] font-black uppercase text-indigo-600 tracking-widest ml-2">Metodologia</span>
+                              <textarea className="w-full bg-slate-50 p-6 rounded-2xl text-base font-bold text-slate-800 outline-none focus:bg-white transition-all border border-slate-100 focus:border-blue-100 shadow-inner" rows={3} value={session.methodology} onChange={e => updateSessionField(idx, 'methodology', e.target.value)} />
+                            </div>
+                            <div className="space-y-4">
+                              <span className="block text-[10px] font-black uppercase text-sky-600 tracking-widest ml-2">Avaluació a la sessió</span>
+                              <textarea className="w-full bg-slate-50 p-6 rounded-2xl text-base font-bold text-slate-800 outline-none focus:bg-white transition-all border border-slate-100 focus:border-blue-100 shadow-inner" rows={3} value={session.evaluation} onChange={e => updateSessionField(idx, 'evaluation', e.target.value)} />
+                            </div>
+                            <div className="md:col-span-2 space-y-4">
+                              <span className="block text-[10px] font-black uppercase text-slate-400 tracking-widest ml-2">Desenvolupament detallat (Activitats i narrativa de l'aula)</span>
+                              <textarea className="w-full bg-slate-50 p-8 rounded-[2rem] text-base font-medium text-slate-700 outline-none focus:bg-white transition-all border border-slate-100 focus:border-blue-100 shadow-inner leading-relaxed" rows={8} value={session.steps} onChange={e => updateSessionField(idx, 'steps', e.target.value)} />
+                            </div>
+                            <div className="md:col-span-2 space-y-4">
+                              <span className="block text-[10px] font-black uppercase text-indigo-600 tracking-widest ml-2 flex items-center gap-2"><Sparkles size={14} /> Pautes i Mesures DUA</span>
+                              <textarea className="w-full bg-indigo-50/30 p-8 rounded-[2rem] text-base font-bold text-indigo-900/70 outline-none focus:bg-white transition-all border border-indigo-100 focus:border-indigo-400 shadow-inner leading-relaxed italic" rows={4} value={session.dua} onChange={e => updateSessionField(idx, 'dua', e.target.value)} />
+                            </div>
+                        </div>
+                      </div>
+                    )) : (
+                      <div className="py-40 text-center border-2 border-dashed border-slate-50 rounded-[3rem] bg-white">
+                        <p className="text-slate-300 font-black uppercase tracking-[0.2em] text-[11px]">Utilitza la IA per dissenyar la seqüència o afegeix sessions manualment</p>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex justify-between items-center pt-10 border-t border-slate-50">
+                    <button onClick={() => setActiveTab('curriculum')} className="text-slate-400 font-black uppercase tracking-widest text-[10px] hover:text-slate-900 transition-colors">Enrere</button>
+                    <button onClick={() => setActiveTab('evaluation')} className="bg-slate-900 text-white px-10 py-5 rounded-2xl font-black uppercase text-[11px] tracking-widest flex items-center gap-3 hover:bg-black shadow-lg transition-all active:scale-95">Següent: Avaluació <ChevronRight size={16} /></button>
+                  </div>
+                </div>
+              )}
+
+              {activeTab === 'evaluation' && (
+                <div className="animate-fade-in space-y-12">
+                  <div className="space-y-8 bg-blue-50/30 p-10 rounded-[2.5rem] border border-blue-100">
+                    <div className="flex flex-col md:flex-row justify-between items-center gap-6">
+                      <div className="flex-1">
+                        <h4 className="font-black text-2xl text-blue-900 tracking-tight">Estratègia d'Avaluació</h4>
+                        <p className="text-blue-700 font-bold text-sm">Selecciona els instruments que t'ajudaran a avaluar els criteris triats.</p>
+                      </div>
+                      <button onClick={handleSuggestEvalTools} disabled={evalLoading} className="bg-blue-600 text-white px-8 py-4 rounded-xl font-black uppercase text-[11px] tracking-widest flex items-center gap-3 shadow-lg hover:bg-blue-700 disabled:opacity-50 transition-all">
+                        {evalLoading ? <Loader2 size={18} className="animate-spin" /> : <Sparkles size={18} />} Suggerir Instruments
+                      </button>
+                    </div>
+
+                    {suggestedEvaluationTools.length > 0 && (
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                        {suggestedEvaluationTools.map((tool, idx) => (
+                          <label key={idx} className={`flex items-center gap-3 p-4 rounded-xl border-2 cursor-pointer transition-all ${evaluationTools.includes(tool) ? 'bg-blue-50 border-blue-500 shadow-sm' : 'bg-white border-slate-50 hover:border-blue-200'}`}>
+                            <input 
+                              type="checkbox" 
+                              checked={evaluationTools.includes(tool)} 
+                              onChange={() => setEvaluationTools(prev => prev.includes(tool) ? prev.filter(t => t !== tool) : [...prev, tool])}
+                              className="w-5 h-5 accent-blue-600"
+                            />
+                            <span className="font-bold text-slate-800 text-xs">{tool}</span>
+                          </label>
+                        ))}
+                      </div>
+                    )}
+
+                    <div className="pt-6 border-t border-blue-100 flex justify-end">
+                      <button onClick={handleGenerateSelectedToolContent} disabled={evaluationTools.length === 0 || generatingToolContent} className="bg-slate-900 text-white px-10 py-5 rounded-2xl font-black uppercase text-[11px] tracking-widest flex items-center gap-3 shadow-xl hover:bg-black disabled:opacity-50 transition-all">
+                        {generatingToolContent ? <Loader2 size={18} className="animate-spin" /> : <Sparkles size={18} />} Generar Contingut d'Avaluació
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                    {evaluationTools.map((tool, idx) => (
+                      <div key={idx} className="bg-white border border-slate-100 rounded-[2.5rem] p-10 hover:border-blue-200 transition-all shadow-sm flex flex-col min-h-[400px]">
+                        <div className="flex justify-between items-center mb-6">
+                          <h5 className="font-black text-blue-700 uppercase tracking-widest text-[10px] bg-blue-50 px-4 py-2 rounded-lg">{tool}</h5>
+                          <button onClick={() => setEvaluationTools(p => p.filter(t => t !== tool))} className="text-slate-200 hover:text-red-500 transition-colors"><X size={20} /></button>
+                        </div>
+                        <div className="prose prose-slate max-w-none text-slate-800 font-medium overflow-auto max-h-[500px] text-sm leading-relaxed" dangerouslySetInnerHTML={{ __html: evaluationToolsContent[tool] || '<p class="text-slate-300 italic animate-pulse">L\'IA generarà el contingut en fer clic al botó superior...</p>' }} />
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="flex justify-between items-center pt-10 border-t border-slate-50">
+                    <button onClick={() => setActiveTab('sequence')} className="text-slate-400 font-black uppercase tracking-widest text-[10px] hover:text-slate-900 transition-colors">Enrere</button>
+                    <button onClick={() => setActiveTab('validation')} className="bg-slate-900 text-white px-10 py-5 rounded-2xl font-black uppercase text-[11px] tracking-widest flex items-center gap-3 hover:bg-black shadow-lg transition-all active:scale-95">Següent: Validació <ChevronRight size={16} /></button>
+                  </div>
+                </div>
+              )}
+
+              {activeTab === 'validation' && (
+                <div className="animate-fade-in space-y-12">
+                  <div className="bg-white p-10 rounded-[3rem] border border-slate-100 shadow-sm">
+                    <div className="flex flex-col md:flex-row items-center justify-between gap-8 mb-12">
+                      <div className="flex items-center gap-6">
+                        <div className={`p-5 rounded-2xl shadow-lg ${validationReport.isValid ? 'bg-emerald-100 text-emerald-600' : 'bg-amber-100 text-amber-600'}`}>
+                          {validationReport.isValid ? <ShieldCheck size={40} /> : <AlertTriangle size={40} />}
+                        </div>
+                        <div>
+                          <h3 className="text-3xl font-black text-slate-900 tracking-tight">Validació Decret 175/2022</h3>
+                          <p className="text-slate-500 font-bold">Verificació automàtica del compliment normatiu de la SA.</p>
+                        </div>
+                      </div>
+                      <div className="flex flex-col items-center">
+                        <div className="text-5xl font-black text-slate-900 mb-2">{validationReport.score}<span className="text-lg text-slate-300">/100</span></div>
+                        <div className="w-32 h-2 bg-slate-100 rounded-full overflow-hidden">
+                          <div className={`h-full transition-all duration-1000 ${validationReport.score > 80 ? 'bg-emerald-500' : validationReport.score > 50 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${validationReport.score}%` }}></div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="space-y-4">
+                      {validationReport.issues.length > 0 ? (
+                        validationReport.issues.map((issue) => (
+                          <div key={issue.id} className={`p-6 rounded-2xl border-2 flex items-start gap-5 transition-all ${issue.type === 'error' ? 'bg-red-50 border-red-100' : 'bg-amber-50 border-amber-100'}`}>
+                            <div className={`mt-1 ${issue.type === 'error' ? 'text-red-600' : 'text-amber-600'}`}>
+                              {issue.type === 'error' ? <X size={20} /> : <AlertTriangle size={20} />}
+                            </div>
+                            <div className="flex-1">
+                              <div className="flex items-center gap-3 mb-1">
+                                <span className={`text-[9px] font-black uppercase tracking-widest px-2 py-1 rounded-md ${issue.type === 'error' ? 'bg-red-600 text-white' : 'bg-amber-600 text-white'}`}>
+                                  {issue.type === 'error' ? 'Requisit Legal' : 'Recomanació'}
+                                </span>
+                                <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">{issue.requirement}</span>
+                              </div>
+                              <p className="text-slate-800 font-bold text-sm leading-relaxed">{issue.message}</p>
+                            </div>
+                          </div>
+                        ))
+                      ) : (
+                        <div className="py-20 text-center bg-emerald-50 rounded-[2.5rem] border-2 border-dashed border-emerald-100">
+                          <div className="bg-white w-20 h-20 rounded-full flex items-center justify-center mx-auto mb-6 shadow-xl text-emerald-600">
+                            <Check size={40} />
+                          </div>
+                          <h4 className="text-2xl font-black text-emerald-900 mb-2">Programació Excel·lent</h4>
+                          <p className="text-emerald-700 font-bold">Aquesta Situació d'Aprenentatge compleix tots els requisits del Decret 175/2022.</p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex justify-between items-center pt-10 border-t border-slate-50">
+                    <button onClick={() => setActiveTab('evaluation')} className="text-slate-400 font-black uppercase tracking-widest text-[10px] hover:text-slate-900 transition-colors">Enrere</button>
+                    <button 
+                      onClick={handleSave} 
+                      className={`px-16 py-6 rounded-[2rem] font-black uppercase text-[12px] tracking-[0.2em] flex items-center gap-4 shadow-2xl transition-all active:scale-95 ${validationReport.isValid ? 'bg-blue-600 text-white hover:bg-blue-700 shadow-blue-200' : 'bg-slate-200 text-slate-400 cursor-not-allowed'}`}
+                      disabled={!validationReport.isValid && !confirm('La SA no compleix tots els requisits legals. Vols guardar-la igualment?')}
+                    >
+                      <Save size={24} /> Guardar Situació d'Aprenentatge
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </main>
+
+      {showInspirationModal && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-6 bg-slate-900/80 backdrop-blur-md animate-fade-in">
+          <div className="bg-white rounded-[3rem] p-12 max-w-2xl w-full shadow-2xl animate-scale-in relative border border-blue-50">
+            <div className="flex justify-between items-center mb-10">
+              <div className="flex items-center gap-6">
+                <div className="bg-blue-100 text-blue-600 p-4 rounded-2xl"><Lightbulb size={32} /></div>
+                <div>
+                  <h2 className="text-3xl font-black text-slate-900 tracking-tight">Idees i Enfocaments</h2>
+                  <p className="text-slate-400 font-bold">Tria una proposta per començar a treballar.</p>
+                </div>
+              </div>
+              <button onClick={() => setShowInspirationModal(false)} className="text-slate-300 hover:text-slate-900 transition-colors"><X size={32} /></button>
+            </div>
+            
+            <div className="grid grid-cols-1 gap-3 max-h-[50vh] overflow-y-auto pr-4 custom-scrollbar">
+              {inspirationOptions.map((opt, i) => (
+                <button 
+                  key={i} 
+                  onClick={() => selectInspiration(opt.title)} 
+                  className="w-full text-left p-6 bg-slate-50/50 border-2 border-slate-50 rounded-2xl hover:border-blue-400 hover:bg-white transition-all group flex items-center justify-between"
+                >
+                  <div>
+                    <span className="text-lg font-black text-slate-900 group-hover:text-blue-600 transition-colors">{opt.title}</span>
+                    <span className="text-[9px] font-black uppercase tracking-widest text-blue-500 bg-blue-50 px-2 py-1 rounded-md mt-2 block w-fit">{opt.style}</span>
+                  </div>
+                  <ChevronRight size={20} className="text-slate-200 group-hover:text-blue-400" />
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {notification && (
+        <div className={`fixed bottom-8 left-1/2 -translate-x-1/2 px-10 py-5 rounded-[2rem] font-black uppercase text-[10px] tracking-[0.2em] shadow-2xl z-[300] animate-slide-up flex items-center gap-4 border-2 ${notification.type === 'success' ? 'bg-slate-900 text-white border-slate-800' : 'bg-red-600 text-white border-red-500'}`}>
+          {notification.type === 'success' ? <Check size={20} className="text-blue-400" /> : <AlertCircle size={20} />}
+          {notification.message}
+        </div>
+      )}
+
+      {viewingActivity && (
+        <ActivityDetailsModal 
+          activity={viewingActivity} 
+          onClose={() => setViewingActivity(null)} 
+          activitySubjectIds={viewingActivity.subjectIds || []} 
+          onDelete={id => setActivities(p => p.filter(a => a.id !== id))} 
+          onEdit={startEditing}
+          onExport={handleExportSingle}
+          showNotification={showNotification} 
+        />
+      )}
+      
+      <footer className="bg-white border-t border-slate-100 py-10 mt-auto shrink-0">
+        <div className="max-w-[1400px] mx-auto px-10 flex flex-col md:flex-row justify-end items-center gap-8">
+          <div className="flex items-center gap-8 text-slate-300">
+             <School size={24} />
+             <div className="h-8 w-px bg-slate-100"></div>
+             <div className="flex items-center gap-4">
+               <div className="flex items-center bg-slate-50 p-1 rounded-2xl border border-slate-100">
+                 <button 
+                  onClick={handleExportAll} 
+                  title="Exportar tota la base de dades" 
+                  className="p-3 hover:bg-white rounded-xl text-slate-400 hover:text-blue-600 transition-all flex items-center gap-2 group"
+                 >
+                   <Download size={18} />
+                   <span className="text-[9px] font-black uppercase tracking-widest hidden lg:block">Backup</span>
+                 </button>
+                 <div className="w-px h-6 bg-slate-200 mx-1"></div>
+                 <button 
+                  onClick={() => fileInputRef.current?.click()} 
+                  title="Importar fitxer JSON" 
+                  className="p-3 hover:bg-white rounded-xl text-slate-400 hover:text-blue-600 transition-all flex items-center gap-2"
+                 >
+                   <Upload size={18} />
+                   <span className="text-[9px] font-black uppercase tracking-widest hidden lg:block">Carregar</span>
+                 </button>
+                 <input type="file" ref={fileInputRef} onChange={handleImport} accept="application/json" style={{ display: 'none' }} />
+               </div>
+             </div>
+          </div>
+        </div>
+      </footer>
+
+      <style>{`
+        @keyframes slideUp {
+          from { transform: translate(-50%, 40px); opacity: 0; }
+          to { transform: translate(-50%, 0); opacity: 1; }
+        }
+        .animate-slide-up {
+          animation: slideUp 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+        }
+        .custom-scrollbar::-webkit-scrollbar {
+          width: 6px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+          background: transparent;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+          background: #e2e8f0;
+          border-radius: 10px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+          background: #cbd5e1;
+        }
+      `}</style>
+    </div>
+  );
+}
